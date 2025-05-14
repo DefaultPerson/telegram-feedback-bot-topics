@@ -35,6 +35,7 @@ def get_user_data(
         "language": language,
     }
 
+from aiogram.exceptions import TelegramBadRequest
 
 @router.message(ForwardableTypesFilter())
 async def any_forwardable_message(
@@ -52,9 +53,6 @@ async def any_forwardable_message(
         await message.answer(error)
         return
 
-    # If message has caption, and it's too long, then we cannot copy it.
-    # Actually, we should be able to copy it, but since it's forum topic, we cannot.
-    # See https://github.com/tdlib/telegram-bot-api/issues/334#issuecomment-1311709507
     if caption_length is not None and caption_length > 1023:
         await message.reply(l10n.format_value("error-caption-too-long"))
         return
@@ -79,7 +77,6 @@ async def any_forwardable_message(
             reason = "Failed to send intro info message from forum group to private chat"
             await logger.aexception(reason)
 
-    # If message is reply to another message, set parameters
     reply_parameters = None
     if reply_to_message_id is not None:
         reply_parameters = ReplyParameters(
@@ -99,11 +96,63 @@ async def any_forwardable_message(
             to_chat_id=forum_chat_id,
             to_message_id=result.message_id,
         )
+
+    except TelegramBadRequest as e:
+        if "message thread not found" in str(e):
+            # Создаём новую тему форума
+            topic_title = f"{message.from_user.full_name} ({message.from_user.id})"
+            try:
+                new_topic = await bot.create_forum_topic(
+                    chat_id=forum_chat_id,
+                    name=topic_title,
+                )
+                topic_id = new_topic.message_thread_id
+
+                # (вставьте здесь сохранение topic_id в хранилище, если нужно)
+                # await save_topic_id(message.from_user.id, topic_id)
+
+                # Отправляем информацию о пользователе в новую тему
+                user_info = get_user_data(l10n, message.from_user)
+                user_info_text = l10n.format_value(
+                    "user-info",
+                    {
+                        "full_name": user_info["full_name"],
+                        "username": user_info["username"],
+                        "premium": user_info["premium"],
+                        "language": user_info["language"],
+                    })
+                await bot.send_message(
+                    chat_id=forum_chat_id,
+                    message_thread_id=topic_id,
+                    text=user_info_text
+                )
+
+                # Повторно копируем сообщение
+                result: MessageId = await message.copy_to(
+                    chat_id=forum_chat_id,
+                    message_thread_id=topic_id,
+                    reply_parameters=reply_parameters,
+                )
+                return MessageConnectionFeedback(
+                    from_chat_id=message.chat.id,
+                    from_message_id=message.message_id,
+                    to_chat_id=forum_chat_id,
+                    to_message_id=result.message_id,
+                )
+            except TelegramAPIError:
+                reason = "Failed to create new topic after thread not found"
+                await logger.aexception(reason)
+                await message.reply(l10n.format_value("error-from-pm-to-group"))
+                return
+        else:
+            await logger.aexception("Unexpected TelegramBadRequest")
+            await message.reply(l10n.format_value("error-from-pm-to-group"))
+            return
+
     except TelegramAPIError:
         reason = "Failed to send message from private chat to forum group"
         await logger.aexception(reason)
         await message.reply(l10n.format_value("error-from-pm-to-group"))
-
 
 @router.message(ServiceMessagesFilter())
 async def any_service_message(
