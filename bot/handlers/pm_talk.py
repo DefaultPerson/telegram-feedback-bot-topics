@@ -1,9 +1,10 @@
 import structlog
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import (
     Message, MessageId, ReplyParameters, User,
-    InputMediaAnimation, InputMediaAudio, InputMediaDocument, InputMediaPhoto, InputMediaVideo,
+    InputMediaAnimation, InputMediaAudio, InputMediaDocument,
+    InputMediaPhoto, InputMediaVideo,
 )
 from fluent.runtime import FluentLocalization
 from structlog.types import FilteringBoundLogger
@@ -14,7 +15,25 @@ from bot.handlers_feedback import MessageConnectionFeedback
 router = Router()
 logger: FilteringBoundLogger = structlog.get_logger()
 
+# ────────────────────────────────────────────────────────────────
+# Простое in-memory-хранилище соответствий «пользователь → topic_id»
+# ────────────────────────────────────────────────────────────────
+_topic_store: dict[int, int] = {}
 
+
+async def save_topic_id(user_id: int, topic_id: int) -> None:
+    """Сохраняем topic_id для пользователя."""
+    _topic_store[user_id] = topic_id
+
+
+async def get_topic_id(user_id: int) -> int | None:
+    """Получаем сохранённый topic_id или None."""
+    return _topic_store.get(user_id)
+
+
+# ────────────────────────────────────────────────────────────────
+# Вспомогательная утилита для форматирования «визитки» пользователя
+# ────────────────────────────────────────────────────────────────
 def get_user_data(
         l10n: FluentLocalization,
         user: User,
@@ -24,10 +43,9 @@ def get_user_data(
 
     language_key = "unknown" if user.language_code is None else user.language_code
     language = l10n.format_value(language_key, {"case": "lower"})
-    if user.username is not None:
-        username = f"@{user.username}"
-    else:
-        username = l10n.format_value("no", {"case": "lower"})
+
+    username = f"@{user.username}" if user.username else l10n.format_value("no", {"case": "lower"})
+
     return {
         "full_name": user.full_name,
         "username": username,
@@ -35,8 +53,10 @@ def get_user_data(
         "language": language,
     }
 
-from aiogram.exceptions import TelegramBadRequest
 
+# ────────────────────────────────────────────────────────────────
+# Обработчик любых «пересылаемых» сообщений
+# ────────────────────────────────────────────────────────────────
 @router.message(ForwardableTypesFilter())
 async def any_forwardable_message(
         message: Message,
@@ -49,6 +69,7 @@ async def any_forwardable_message(
         reply_to_message_id: int | None = None,
         caption_length: int | None = None,
 ):
+    # 1) Быстрые выходы
     if error is not None:
         await message.answer(error)
         return
@@ -57,7 +78,12 @@ async def any_forwardable_message(
         await message.reply(l10n.format_value("error-caption-too-long"))
         return
 
-    if new_topic_created is True:
+    # 2) Если dependency не передала topic_id — ищем в хранилище
+    if topic_id is None:
+        topic_id = await get_topic_id(message.from_user.id)
+
+    # 3) При создании новой ветки (флаг new_topic_created) публикуем визитку
+    if new_topic_created is True and topic_id is not None:
         user_info = get_user_data(l10n, message.from_user)
         user_info_text = l10n.format_value(
             "user-info",
@@ -71,12 +97,12 @@ async def any_forwardable_message(
             await bot.send_message(
                 chat_id=forum_chat_id,
                 message_thread_id=topic_id,
-                text=user_info_text
+                text=user_info_text,
             )
         except TelegramAPIError:
-            reason = "Failed to send intro info message from forum group to private chat"
-            await logger.aexception(reason)
+            await logger.aexception("Failed to send intro info message from forum group to private chat")
 
+    # 4) Формируем параметры ответа (если нужно)
     reply_parameters = None
     if reply_to_message_id is not None:
         reply_parameters = ReplyParameters(
@@ -84,6 +110,7 @@ async def any_forwardable_message(
             allow_sending_without_reply=True,
         )
 
+    # 5) Пытаемся переслать сообщение в нужную ветку
     try:
         result: MessageId = await message.copy_to(
             chat_id=forum_chat_id,
@@ -97,63 +124,63 @@ async def any_forwardable_message(
             to_message_id=result.message_id,
         )
 
+    # ───────────────────────────────────────────────────────
+    # Ветка удалена / «архивирована»  → создаём новую
+    # ───────────────────────────────────────────────────────
     except TelegramBadRequest as e:
         if "message thread not found" in str(e):
-            # Создаём новую тему форума
+            # 5.1) Создаём новую ветку
             topic_title = f"{message.from_user.full_name} ({message.from_user.id})"
-            try:
-                new_topic = await bot.create_forum_topic(
-                    chat_id=forum_chat_id,
-                    name=topic_title,
-                )
-                topic_id = new_topic.message_thread_id
+            new_topic = await bot.create_forum_topic(
+                chat_id=forum_chat_id,
+                name=topic_title,
+            )
+            topic_id = new_topic.message_thread_id
+            await save_topic_id(message.from_user.id, topic_id)
 
-                # (вставьте здесь сохранение topic_id в хранилище, если нужно)
-                # await save_topic_id(message.from_user.id, topic_id)
+            # 5.2) Публикуем визитку пользователя
+            user_info = get_user_data(l10n, message.from_user)
+            user_info_text = l10n.format_value(
+                "user-info",
+                {
+                    "full_name": user_info["full_name"],
+                    "username": user_info["username"],
+                    "premium": user_info["premium"],
+                    "language": user_info["language"],
+                })
+            await bot.send_message(
+                chat_id=forum_chat_id,
+                message_thread_id=topic_id,
+                text=user_info_text,
+            )
 
-                # Отправляем информацию о пользователе в новую тему
-                user_info = get_user_data(l10n, message.from_user)
-                user_info_text = l10n.format_value(
-                    "user-info",
-                    {
-                        "full_name": user_info["full_name"],
-                        "username": user_info["username"],
-                        "premium": user_info["premium"],
-                        "language": user_info["language"],
-                    })
-                await bot.send_message(
-                    chat_id=forum_chat_id,
-                    message_thread_id=topic_id,
-                    text=user_info_text
-                )
+            # 5.3) Повторяем пересылку
+            result: MessageId = await message.copy_to(
+                chat_id=forum_chat_id,
+                message_thread_id=topic_id,
+                reply_parameters=reply_parameters,
+            )
+            return MessageConnectionFeedback(
+                from_chat_id=message.chat.id,
+                from_message_id=message.message_id,
+                to_chat_id=forum_chat_id,
+                to_message_id=result.message_id,
+            )
 
-                # Повторно копируем сообщение
-                result: MessageId = await message.copy_to(
-                    chat_id=forum_chat_id,
-                    message_thread_id=topic_id,
-                    reply_parameters=reply_parameters,
-                )
-                return MessageConnectionFeedback(
-                    from_chat_id=message.chat.id,
-                    from_message_id=message.message_id,
-                    to_chat_id=forum_chat_id,
-                    to_message_id=result.message_id,
-                )
-            except TelegramAPIError:
-                reason = "Failed to create new topic after thread not found"
-                await logger.aexception(reason)
-                await message.reply(l10n.format_value("error-from-pm-to-group"))
-                return
-        else:
-            await logger.aexception("Unexpected TelegramBadRequest")
-            await message.reply(l10n.format_value("error-from-pm-to-group"))
-            return
+        # Если причина BadRequest другая — пробрасываем выше
+        raise
 
+    # ───────────────────────────────────────────────────────
+    # Любая иная ошибка Telegram API
+    # ───────────────────────────────────────────────────────
     except TelegramAPIError:
-        reason = "Failed to send message from private chat to forum group"
-        await logger.aexception(reason)
+        await logger.aexception("Failed to send message from private chat to forum group")
         await message.reply(l10n.format_value("error-from-pm-to-group"))
 
+
+# ────────────────────────────────────────────────────────────────
+# Сервисные сообщения мы игнорируем
+# ────────────────────────────────────────────────────────────────
 @router.message(ServiceMessagesFilter())
 async def any_service_message(
         message: Message,
@@ -161,6 +188,9 @@ async def any_service_message(
     return
 
 
+# ────────────────────────────────────────────────────────────────
+# Сообщения «непересылаемых» типов
+# ────────────────────────────────────────────────────────────────
 @router.message()
 async def any_non_forwardable_message(
         message: Message,
@@ -169,6 +199,9 @@ async def any_non_forwardable_message(
     await message.reply(l10n.format_value("error-non-forwardable-type"))
 
 
+# ────────────────────────────────────────────────────────────────
+# Редактирование ТЕКСТОВЫХ сообщений
+# ────────────────────────────────────────────────────────────────
 @router.edited_message(F.text)
 async def edited_text_message(
         message: Message,
@@ -188,11 +221,13 @@ async def edited_text_message(
             entities=message.entities,
         )
     except TelegramAPIError:
-        error = "Failed to edit text message on group side"
-        await logger.aexception(error)
+        await logger.aexception("Failed to edit text message on group side")
 
 
-@router.edited_message()  # All other types of editable media
+# ────────────────────────────────────────────────────────────────
+# Редактирование медиа-сообщений
+# ────────────────────────────────────────────────────────────────
+@router.edited_message()  # Все прочие типы редактируемых медиа
 async def edited_media_message(
         message: Message,
         bot: Bot,
@@ -228,5 +263,4 @@ async def edited_media_message(
             media=new_media,
         )
     except TelegramAPIError:
-        error = "Failed to edit media message on group side"
-        await logger.aexception(error)
+        await logger.aexception("Failed to edit media message on group side")
