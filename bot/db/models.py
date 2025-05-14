@@ -4,6 +4,7 @@ from uuid import uuid4
 from sqlalchemy import UniqueConstraint, func, select, and_, TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID, BIGINT, INTEGER
 from sqlalchemy.orm import mapped_column, Mapped
+from sqlalchemy import select, desc
 
 from bot.db.base import Base
 
@@ -83,9 +84,15 @@ class Topic(Base):
     def find_by_user_id(cls, user_id: int):
         return select(cls).where(Topic.user_id == user_id)
 
+
     @classmethod
     def find_by_topic_id(cls, topic_id: int):
-        return select(cls).where(Topic.topic_id == topic_id)
+        return (
+            select(cls)
+            .where(cls.topic_id == topic_id)
+            .order_by(desc(cls.created_at))
+            .limit(1)
+        )
 
     def __repr__(self):
         return f"Topic #{self.topic_id} for user {self.user_id}"
