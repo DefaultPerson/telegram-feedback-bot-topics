@@ -23,7 +23,7 @@ services:
     # Also copy any language file and place it in the root of your project.
     volumes:
       - "./settings.toml:/app/settings.toml:ro"
-      - "./ru.ftl:/app/bot/locale/current/strings.ftl:ro"
+      - "./en.ftl:/app/bot/locale/current/strings.ftl:ro"
     depends_on:
       - postgres
 
